@@ -43,6 +43,7 @@ PreservedAnalyses HelloWorldPass::run(Function &F,
   errs() << "safe geps" << "\n";
   auto context = std::make_unique<LLVMContext>();
   for (BasicBlock &b : F) {
+    std::vector<AllocaInst *> Worklist;
     // Get all Allocas in the block
     for (Instruction &i : b) {
       if (AllocaInst *ai = dyn_cast<AllocaInst>(&i)) {
@@ -55,7 +56,8 @@ PreservedAnalyses HelloWorldPass::run(Function &F,
           // check if the use is a getelementptr
           if (GetElementPtrInst *gep =
                   dyn_cast<GetElementPtrInst>(u.getUser())) {
-            if (!gep->hasAllConstantIndices()) {
+            if (!gep->hasAllConstantIndices() ||
+                cast<ConstantInt>(gep->getOperand(1))->getZExtValue() != 0) {
               can_rewrite = false;
               break;
             }
@@ -78,28 +80,43 @@ PreservedAnalyses HelloWorldPass::run(Function &F,
           }
         }
         if (can_rewrite) {
-          std::vector<AllocaInst *> allocas;
-          for (unsigned int i = 0; i < ty->getNumContainedTypes(); i++) {
-            allocas.push_back(new AllocaInst(ty->getContainedType(i), 0,
-                                             "split", ai->getIterator()));
-          }
-          // replace all getelementptrs to use new allocas
-          for (Use &u : ai->uses()) {
-            GetElementPtrInst *gep = cast<GetElementPtrInst>(u.getUser());
-            AllocaInst *which_alloca =
-                allocas[cast<ConstantInt>(gep->getOperand(1))->getZExtValue()];
-            ReplaceInstWithInst(
-                gep->getParent(), gep->getIterator(),
-                GetElementPtrInst::Create(
-                    which_alloca->getAllocatedType(), which_alloca,
-                    ArrayRef(gep->op_begin() + 2, gep->op_end()),
-                    gep->getName()));
-          }
-          // ai->eraseFromParent();
+          Worklist.push_back(ai);
         }
       }
     }
+    for (auto &ai : Worklist) {
+      errs() << *ai << "\n";
+      Type *ty = ai->getAllocatedType();
+      SmallVector<AllocaInst *, 16> allocas;
+      for (unsigned int i = 0; i < ty->getNumContainedTypes(); i++) {
+        allocas.push_back(new AllocaInst(ty->getContainedType(i), 0, "split",
+                                         ai->getIterator()));
+      }
+      // replace all getelementptrs to use new allocas
+      SmallVector<GetElementPtrInst *, 16> old_geps;
+      SmallVector<GetElementPtrInst *, 16> new_geps;
+      for (Use &u : ai->uses()) {
+        GetElementPtrInst *gep = cast<GetElementPtrInst>(u.getUser());
+        errs() << *gep << "\n";
+        errs() << cast<ConstantInt>(gep->getOperand(2))->getZExtValue() << "\n";
+        AllocaInst *which_alloca =
+            allocas[cast<ConstantInt>(gep->getOperand(2))->getZExtValue()];
+        if (gep->getNumIndices() > 2) {
+          // we need to replace with another getelementptr
+          SmallVector<Value *, 8> Indices(gep->op_begin() + 3, gep->op_end());
+          GetElementPtrInst::Create(which_alloca->getAllocatedType(),
+                                    which_alloca, ArrayRef(Indices),
+                                    gep->getName(), gep->getIterator());
+        } else {
+          gep->replaceAllUsesWith(which_alloca);
+        }
+        old_geps.push_back(gep);
+      }
+      for (GetElementPtrInst *gep : old_geps) {
+        gep->eraseFromParent();
+      }
+      ai->eraseFromParent();
+    }
   }
-
   return PreservedAnalyses::none();
 }
